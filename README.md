@@ -3,6 +3,14 @@
 Одна команда — и свежий Ubuntu/Debian VPS превращается в затюненную ноду
 для **Remnawave** / **xray** / любого docker-compose стека.
 
+Умеет **три режима**:
+
+| Режим | Флаг | Что делает |
+|---|---|---|
+| **Install** | _(по умолчанию)_ | Полная установка с нуля: apt upgrade, тюнинг, Docker, UFW reset, paste compose |
+| **Update** | `--update` / `-u` | Докатить новый тюнинг на уже настроенную ноду: **не трогает контейнеры**, не делает apt upgrade, UFW merge (не reset). Для раздачи друзьям. |
+| **Check** | `--check` | Read-only: какие компоненты на месте, какая версия скрипта применена |
+
 ## Что делает
 
 1. `apt update && upgrade` + базовые утилиты (ufw, chrony, jq, htop, iftop, iotop…)
@@ -16,10 +24,27 @@
 
 ## Быстрый старт
 
-На свежем сервере под `root`:
+На **свежем** сервере под `root`:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/jestivald/node-bootstrap/main/node-bootstrap.sh)
+```
+
+На **уже настроенной** ноде — проверить что есть, и обновить тюнинг до свежей версии скрипта:
+
+```bash
+# Посмотреть состояние (ничего не меняет)
+bash <(curl -fsSL https://raw.githubusercontent.com/jestivald/node-bootstrap/main/node-bootstrap.sh) --check
+
+# Докатить новые улучшения (контейнеры не трогаются)
+bash <(curl -fsSL https://raw.githubusercontent.com/jestivald/node-bootstrap/main/node-bootstrap.sh) --update
+```
+
+Для друзей можно написать короткий алиас в `~/.bashrc`:
+
+```bash
+alias node-check='bash <(curl -fsSL https://raw.githubusercontent.com/jestivald/node-bootstrap/main/node-bootstrap.sh) --check'
+alias node-update='bash <(curl -fsSL https://raw.githubusercontent.com/jestivald/node-bootstrap/main/node-bootstrap.sh) --update'
 ```
 
 Скрипт спросит подтверждение, прогонит все шаги, а в конце попросит:
@@ -98,6 +123,10 @@ SECRET_KEY=eyJub2RlQ2VydFBlbSI6...
 | `--no-ufw` | Не трогать firewall |
 | `--no-docker` | Не ставить Docker |
 | `--no-compose` | Не деплоить compose |
+| `--no-upgrade` | Пропустить `apt upgrade` (быстрее) |
+| `-u`, `--update` | **Update-режим** (см. выше): без upgrade, без compose, UFW merge |
+| `--check` | **Check-режим**: только отчёт о состоянии, ничего не меняет |
+| `-V`, `--version` | Показать версию скрипта и выйти |
 
 Пример полностью неинтерактивного запуска:
 
@@ -124,13 +153,28 @@ chmod +x node-bootstrap.sh
   уже настроены кастомные правила — используй `--no-ufw` и правь руками.
 - `.env` сохраняется с `chmod 600`.
 
-## Идемпотентность
+## Идемпотентность и версионирование
 
 Повторный запуск безопасен:
 
 - Docker не переустанавливается, если уже стоит
 - Swap не создаётся, если уже есть
 - compose просто перезапишется и перезапустится (`up -d`)
+- Предыдущий `docker-compose.yml` бэкапится в `*.bak.<timestamp>`
+
+После запуска пишется версия в `/etc/node-bootstrap.version`. При следующем запуске
+`--check` сравнит её с текущей версией скрипта и скажет, нужен ли `--update`.
+
+Типовой workflow обновления ноды у друга:
+
+```bash
+# На его сервере
+bash <(curl -fsSL .../node-bootstrap.sh) --check
+# → показывает "Installed version 1.0.0, script 1.1.0 — run --update"
+
+bash <(curl -fsSL .../node-bootstrap.sh) --update
+# → докатывает новый тюнинг, контейнеры не трогает
+```
 
 ## Лицензия
 
