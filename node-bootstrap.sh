@@ -247,58 +247,128 @@ else
     warn "Skipping UFW (--no-ufw)"
 fi
 
+# ---------- compose helpers -------------------------------------------------
+# Read a multi-line block from /dev/tty until EOF or __END__ sentinel
+paste_block() {
+    local out="$1" line
+    : >"$out"
+    while IFS= read -r line </dev/tty; do
+        [[ "$line" == "__END__" ]] && break
+        printf '%s\n' "$line" >>"$out"
+    done
+}
+
+# Strip common paste garbage: blank lines and stray URLs/shell prompts BEFORE
+# the first real YAML key. Keeps everything once a real YAML line is seen.
+clean_yaml() {
+    local src="$1" dst="$2"
+    awk '
+        BEGIN { started=0 }
+        started { print; next }
+        # skip blank lines and obvious junk before YAML starts
+        /^[[:space:]]*$/ { next }
+        /^[[:space:]]*#/ { print; started=1; next }
+        /^(https?:\/\/|root@|\$ |# )/ { next }
+        # first real YAML top-level key: services|version|networks|volumes|configs|secrets|x-
+        /^(services|version|networks|volumes|configs|secrets|name|x-[a-zA-Z0-9_-]+):/ { started=1; print; next }
+        { started=1; print }
+    ' "$src" >"$dst"
+}
+
+# Try `docker compose config` to validate YAML. Return 0 if valid.
+validate_compose() {
+    ( cd "$(dirname "$1")" && docker compose -f "$(basename "$1")" config --quiet ) 2>&1
+}
+
 # ---------- compose deploy --------------------------------------------------
 if [[ $DO_COMPOSE -eq 1 ]]; then
     step "Deploying docker-compose stack"
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
+    # Backup previous compose if exists
+    if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
+        cp "$INSTALL_DIR/docker-compose.yml" "$INSTALL_DIR/docker-compose.yml.bak.$(date +%s)"
+        log "Previous compose backed up"
+    fi
+
     if [[ -n "$COMPOSE_FILE" ]]; then
         [[ -f "$COMPOSE_FILE" ]] || die "Compose file not found: $COMPOSE_FILE"
         cp "$COMPOSE_FILE" "$INSTALL_DIR/docker-compose.yml"
         ok "Copied compose from $COMPOSE_FILE"
     else
-        echo
-        echo "${C_BOLD}Paste your full docker-compose.yml below.${C_N}"
-        echo "When done, press ${C_BOLD}Ctrl-D${C_N} on an empty line to finish."
-        echo "(or type a single line with   ${C_BOLD}__END__${C_N}   to finish)"
-        echo "---------------------------- BEGIN PASTE ----------------------------"
-        # Read from /dev/tty so it works even when script was piped from curl
-        tmp="$(mktemp)"
-        while IFS= read -r line </dev/tty; do
-            [[ "$line" == "__END__" ]] && break
-            printf '%s\n' "$line" >>"$tmp"
+        attempt=0
+        while :; do
+            attempt=$((attempt+1))
+            echo
+            echo "${C_BOLD}Paste your full docker-compose.yml below.${C_N}"
+            echo "Finish with ${C_BOLD}Ctrl-D${C_N} on empty line,  or type  ${C_BOLD}__END__${C_N}"
+            echo "--------------------------- BEGIN PASTE ---------------------------"
+            raw="$(mktemp)"
+            paste_block "$raw"
+            echo "---------------------------- END PASTE ----------------------------"
+            [[ -s "$raw" ]] || { warn "Empty paste"; rm -f "$raw"; [[ $attempt -ge 3 ]] && die "Aborted after 3 empty attempts."; continue; }
+
+            # Clean leading junk (stray URLs, blank lines)
+            cleaned="$(mktemp)"
+            clean_yaml "$raw" "$cleaned"
+            removed=$(( $(wc -l <"$raw") - $(wc -l <"$cleaned") ))
+            [[ $removed -gt 0 ]] && warn "Stripped $removed junk line(s) before first YAML key"
+
+            mv "$cleaned" "$INSTALL_DIR/docker-compose.yml"
+            rm -f "$raw"
+
+            # Validate
+            log "Validating YAML..."
+            if err=$(validate_compose "$INSTALL_DIR/docker-compose.yml"); then
+                ok "Compose valid ($(wc -l <"$INSTALL_DIR/docker-compose.yml") lines)"
+                break
+            else
+                echo "${C_R}YAML error:${C_N}"
+                echo "$err"
+                if [[ $attempt -ge 3 ]]; then
+                    die "Still invalid after 3 attempts. Fix file manually: $INSTALL_DIR/docker-compose.yml"
+                fi
+                read -r -p "Try paste again? [Y/n] " again </dev/tty
+                [[ "$again" =~ ^[Nn]$ ]] && die "Aborted."
+            fi
         done
-        echo "----------------------------- END PASTE -----------------------------"
-        [[ -s "$tmp" ]] || die "Empty compose — aborting."
-        mv "$tmp" "$INSTALL_DIR/docker-compose.yml"
-        ok "Compose saved to $INSTALL_DIR/docker-compose.yml ($(wc -l <"$INSTALL_DIR/docker-compose.yml") lines)"
     fi
 
+    # --- .env handling ------------------------------------------------------
     if [[ -n "$ENV_FILE" ]]; then
         [[ -f "$ENV_FILE" ]] || die ".env file not found: $ENV_FILE"
         cp "$ENV_FILE" "$INSTALL_DIR/.env"
         chmod 600 "$INSTALL_DIR/.env"
         ok "Copied .env"
-    elif [[ ! -f "$INSTALL_DIR/.env" ]]; then
-        echo
-        read -r -p "Paste a .env file too? [y/N] " want_env </dev/tty
-        if [[ "$want_env" =~ ^[Yy]$ ]]; then
-            echo "Paste .env contents. Ctrl-D or __END__ to finish."
-            echo "---------------------------- BEGIN PASTE ----------------------------"
-            tmp="$(mktemp)"
-            while IFS= read -r line </dev/tty; do
-                [[ "$line" == "__END__" ]] && break
-                printf '%s\n' "$line" >>"$tmp"
-            done
-            echo "----------------------------- END PASTE -----------------------------"
-            if [[ -s "$tmp" ]]; then
-                mv "$tmp" "$INSTALL_DIR/.env"
-                chmod 600 "$INSTALL_DIR/.env"
-                ok ".env saved"
-            else
-                rm -f "$tmp"
-                warn "Empty .env — skipping"
+    else
+        # Auto-detect if compose references env_file: .env
+        need_env=0
+        grep -qE '^\s*env_file:' "$INSTALL_DIR/docker-compose.yml" && need_env=1
+
+        if [[ $need_env -eq 1 && ! -f "$INSTALL_DIR/.env" ]]; then
+            warn "Compose references env_file but .env is missing"
+        fi
+
+        if [[ ! -f "$INSTALL_DIR/.env" ]]; then
+            echo
+            read -r -p "Paste a .env file? [y/N] " want_env </dev/tty
+            if [[ "$want_env" =~ ^[Yy]$ ]]; then
+                echo "Paste .env contents. Ctrl-D or __END__ to finish."
+                echo "--------------------------- BEGIN PASTE ---------------------------"
+                tmp="$(mktemp)"
+                paste_block "$tmp"
+                echo "---------------------------- END PASTE ----------------------------"
+                if [[ -s "$tmp" ]]; then
+                    # Strip accidental quotes around values (SECRET_KEY="..." -> SECRET_KEY=...)
+                    sed -i -E 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\1=\2/' "$tmp"
+                    mv "$tmp" "$INSTALL_DIR/.env"
+                    chmod 600 "$INSTALL_DIR/.env"
+                    ok ".env saved ($(wc -l <"$INSTALL_DIR/.env") lines)"
+                else
+                    rm -f "$tmp"
+                    warn "Empty .env — skipping"
+                fi
             fi
         fi
     fi
@@ -307,12 +377,16 @@ if [[ $DO_COMPOSE -eq 1 ]]; then
     docker compose pull
     log "docker compose up -d"
     docker compose up -d
-    sleep 4
+    sleep 5
     echo
     docker compose ps
     echo
+    # Warn if any container already restarting (common sign of bad env/secret)
+    if docker compose ps --format json 2>/dev/null | grep -q '"State":"restarting"'; then
+        warn "Some container is restarting — check logs below:"
+    fi
     log "Recent logs:"
-    docker compose logs --tail 25 || true
+    docker compose logs --tail 30 || true
 fi
 
 # ---------- summary ---------------------------------------------------------
