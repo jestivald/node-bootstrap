@@ -49,6 +49,8 @@ services:
     network_mode: host
     env_file:
       - .env
+    cap_add:
+      - NET_ADMIN
     ulimits:
       nofile:
         soft: 1048576
@@ -60,14 +62,28 @@ services:
         max-file: "3"
 ```
 
-Затем в `.env`:
+После Ctrl-D скрипт увидит `env_file:` и сам предложит вставить `.env`:
 
 ```env
 NODE_PORT=2222
-SECRET_KEY="eyJub2RlQ2VydFBlbSI6..."
+SECRET_KEY=eyJub2RlQ2VydFBlbSI6...
 ```
 
+> **Важно:** SECRET_KEY пиши **без кавычек**. Если вставишь с кавычками — скрипт сам их уберёт.
+> Не суй SECRET_KEY в `environment:` внутри compose как `SECRET_KEY="..."` — YAML сохранит кавычки в значении, и Remnawave упадёт.
+
 После этого на панели добавляешь ноду по `IP_СЕРВЕРА:2222`.
+
+## Защита от кривого paste
+
+Скрипт теперь:
+
+- **Валидирует YAML** через `docker compose config` до деплоя. Невалидно — покажет ошибку и предложит вставить ещё раз (до 3 попыток).
+- **Убирает мусор в начале** — случайные URL, приглашения `root@...`, пустые строки до первого `services:` / `version:`.
+- **Бэкапит** предыдущий `docker-compose.yml` перед заменой (`*.bak.<timestamp>`).
+- **Предупреждает**, если в compose есть `env_file:`, но `.env` отсутствует.
+- **Убирает кавычки** вокруг значений в `.env` автоматически.
+- **Детектит `restarting`** контейнеры после `up -d` и сразу показывает логи.
 
 ## Флаги
 
