@@ -2,6 +2,8 @@
 # ============================================================================
 #  node-bootstrap.sh  —  One-shot Remnawave / xray node provisioner
 # ----------------------------------------------------------------------------
+#  Version: 1.1.0      https://github.com/jestivald/node-bootstrap
+# ----------------------------------------------------------------------------
 #  What it does (in order):
 #    1. Apt update + essentials (curl, ufw, chrony, jq, htop, ...)
 #    2. Kernel / network tuning  (BBR + fq, buffers, backlog, fs.file-max)
@@ -12,6 +14,15 @@
 #    7. UFW: allow 22, 443/tcp, 443/udp, 2222/tcp   (default deny in)
 #    8. Prompts you to PASTE a full docker-compose.yml into the terminal,
 #       then `docker compose up -d` in /opt/node
+#
+#  Special modes:
+#    --check   Read-only inspection: what's applied, what's missing, version.
+#    --update  Re-apply tuning on an already-provisioned node:
+#                • skips apt upgrade (faster)
+#                • skips compose paste (won't touch your containers)
+#                • UFW: ADD missing required ports, don't reset existing rules
+#                • bumps sysctl / limits / daemon.json / journald if outdated
+#              Use this to push newer tuning to friends who already have a node.
 #
 #  Usage (one-liner, interactive — paste compose when asked, finish with Ctrl-D):
 #    bash <(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/node-bootstrap.sh)
@@ -29,6 +40,9 @@
 #    --yes       don't ask for confirmation
 # ============================================================================
 set -euo pipefail
+
+BOOTSTRAP_VERSION="1.1.0"
+STAMP_FILE="/etc/node-bootstrap.version"
 
 # ---------- colors / logging ------------------------------------------------
 if [[ -t 1 ]]; then
@@ -49,6 +63,8 @@ COMPOSE_FILE=""
 ENV_FILE=""
 EXTRA_PORTS=""
 DO_SWAP=1 DO_UFW=1 DO_DOCKER=1 DO_COMPOSE=1 ASSUME_YES=0
+MODE="install"           # install | update | check
+SKIP_APT_UPGRADE=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -60,8 +76,12 @@ for arg in "$@"; do
         --no-ufw)         DO_UFW=0 ;;
         --no-docker)      DO_DOCKER=0 ;;
         --no-compose)     DO_COMPOSE=0 ;;
+        --no-upgrade)     SKIP_APT_UPGRADE=1 ;;
         --yes|-y)         ASSUME_YES=1 ;;
-        -h|--help)        sed -n '2,40p' "$0"; exit 0 ;;
+        --update|-u)      MODE="update"; DO_COMPOSE=0; SKIP_APT_UPGRADE=1; ASSUME_YES=1 ;;
+        --check)          MODE="check" ;;
+        --version|-V)     echo "node-bootstrap $BOOTSTRAP_VERSION"; exit 0 ;;
+        -h|--help)        sed -n '2,48p' "$0"; exit 0 ;;
         *) die "Unknown arg: $arg" ;;
     esac
 done
@@ -74,11 +94,101 @@ case "$ID" in
     *) warn "Tested on Ubuntu/Debian; detected $ID $VERSION_ID — continuing anyway." ;;
 esac
 
-echo "${C_BOLD}Node bootstrap${C_N}"
+# ---------- state inspection -----------------------------------------------
+# Returns "OK"/"MISS"/"OLD" for each component, prints human-readable table.
+check_state() {
+    local prev_ver="none"
+    [[ -f "$STAMP_FILE" ]] && prev_ver=$(cat "$STAMP_FILE" 2>/dev/null || echo unknown)
+
+    echo "${C_BOLD}Current state on $(hostname):${C_N}"
+    echo "  Installed version : $prev_ver   (script: $BOOTSTRAP_VERSION)"
+    echo "  OS                : ${PRETTY_NAME:-$ID $VERSION_ID}"
+    echo "  Uptime            : $(uptime -p 2>/dev/null || echo '?')"
+    echo
+
+    # BBR
+    local cc qdisc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')
+    if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then ok "BBR + fq active"
+    else warn "BBR/fq NOT active  (got: cc=$cc qdisc=$qdisc)"; fi
+
+    # sysctl tune file
+    if [[ -f /etc/sysctl.d/99-node-tune.conf ]]; then ok "sysctl tuning installed"
+    else warn "sysctl tuning MISSING (/etc/sysctl.d/99-node-tune.conf)"; fi
+
+    # ulimits
+    if [[ -f /etc/security/limits.d/99-node.conf ]]; then ok "ulimits file installed"
+    else warn "ulimits file MISSING"; fi
+
+    # swap
+    if swapon --show 2>/dev/null | grep -q .; then
+        ok "swap: $(swapon --show --noheadings | awk '{print $1,$3}' | tr '\n' '; ')"
+    else warn "swap: NOT configured"; fi
+
+    # journald
+    if [[ -f /etc/systemd/journald.conf.d/size.conf ]]; then ok "journald capped"
+    else warn "journald cap MISSING"; fi
+
+    # docker
+    if command -v docker >/dev/null 2>&1; then
+        ok "docker: $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,) / compose: $(docker compose version --short 2>/dev/null || echo '?')"
+        if [[ -f /etc/docker/daemon.json ]] && grep -q '"live-restore"' /etc/docker/daemon.json 2>/dev/null; then
+            ok "docker daemon.json tuned"
+        else warn "docker daemon.json NOT tuned"; fi
+    else warn "docker: NOT installed"; fi
+
+    # ufw
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ok "ufw: active  ($(ufw status 2>/dev/null | grep -c ALLOW) allow rules)"
+        for p in 22/tcp 443/tcp 443/udp 2222/tcp; do
+            if ufw status 2>/dev/null | grep -q "^$p .*ALLOW"; then
+                echo "      ✓ $p"
+            else
+                echo "      ${C_Y}✗ $p MISSING${C_N}"
+            fi
+        done
+    else warn "ufw: inactive or missing"; fi
+
+    # compose
+    if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
+        ok "compose: $INSTALL_DIR/docker-compose.yml present"
+        if command -v docker >/dev/null 2>&1; then
+            local running=$(cd "$INSTALL_DIR" && docker compose ps --services --filter status=running 2>/dev/null | wc -l)
+            local total=$(cd "$INSTALL_DIR" && docker compose ps --services 2>/dev/null | wc -l)
+            echo "      containers running: $running / $total"
+        fi
+    else warn "compose: no file at $INSTALL_DIR/docker-compose.yml"; fi
+
+    # version comparison hint
+    if [[ "$prev_ver" != "none" && "$prev_ver" != "$BOOTSTRAP_VERSION" ]]; then
+        echo
+        warn "Installed version ($prev_ver) differs from script ($BOOTSTRAP_VERSION)."
+        echo "    Run with ${C_BOLD}--update${C_N} to apply newer tuning without touching containers."
+    elif [[ "$prev_ver" == "$BOOTSTRAP_VERSION" ]]; then
+        echo
+        ok "Node is at latest version ($BOOTSTRAP_VERSION)."
+    fi
+}
+
+# --check mode: print state and exit
+if [[ "$MODE" == "check" ]]; then
+    check_state
+    exit 0
+fi
+
+echo "${C_BOLD}Node bootstrap v$BOOTSTRAP_VERSION${C_N}  [mode: $MODE]"
 echo "  Host:     $(hostname) ($(hostname -I 2>/dev/null | awk '{print $1}'))"
 echo "  OS:       ${PRETTY_NAME:-$ID $VERSION_ID}"
 echo "  Install:  ${INSTALL_DIR}"
 echo "  Ports:    22, 443/tcp, 443/udp, 2222/tcp${EXTRA_PORTS:+, $EXTRA_PORTS}"
+if [[ -f "$STAMP_FILE" ]]; then
+    echo "  Previous: $(cat "$STAMP_FILE") (stamp on this host)"
+fi
+echo
+if [[ "$MODE" == "update" ]]; then
+    log "UPDATE mode: apt upgrade SKIPPED, compose SKIPPED, UFW rules MERGED (not reset)"
+fi
 echo
 if [[ $ASSUME_YES -eq 0 ]]; then
     read -r -p "Proceed? [y/N] " ans </dev/tty
@@ -90,7 +200,11 @@ export DEBIAN_FRONTEND=noninteractive
 # ---------- 1. apt essentials ----------------------------------------------
 step "1/7  Updating apt + installing essentials"
 apt-get update -y
-apt-get upgrade -y
+if [[ $SKIP_APT_UPGRADE -eq 0 ]]; then
+    apt-get upgrade -y
+else
+    log "apt upgrade skipped (--update / --no-upgrade)"
+fi
 apt-get install -y curl wget gnupg ca-certificates lsb-release \
     software-properties-common ufw htop iftop iotop jq \
     net-tools dnsutils chrony unzip
@@ -226,13 +340,34 @@ fi
 # ---------- 7. ufw ----------------------------------------------------------
 if [[ $DO_UFW -eq 1 ]]; then
     step "7/7  UFW firewall"
-    ufw --force reset >/dev/null
-    ufw default deny incoming  >/dev/null
-    ufw default allow outgoing >/dev/null
-    ufw allow 22/tcp   comment 'SSH'                    >/dev/null
-    ufw allow 443/tcp  comment 'xray tls/reality'       >/dev/null
-    ufw allow 443/udp  comment 'xray quic/hysteria'     >/dev/null
-    ufw allow 2222/tcp comment 'remnawave node api'     >/dev/null
+    if [[ "$MODE" == "update" ]]; then
+        # Merge mode: only ADD missing required rules, don't reset
+        log "UFW merge mode — adding missing rules only"
+        for rule in "22/tcp|SSH" "443/tcp|xray tls/reality" "443/udp|xray quic/hysteria" "2222/tcp|remnawave node api"; do
+            port="${rule%%|*}"; comment="${rule#*|}"
+            if ufw status 2>/dev/null | grep -q "^$port .*ALLOW"; then
+                echo "    ✓ $port already allowed"
+            else
+                ufw allow "$port" comment "$comment" >/dev/null
+                log "Added $port ($comment)"
+            fi
+        done
+        # Ensure ufw is enabled
+        if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw --force enable >/dev/null
+            log "UFW enabled"
+        fi
+    else
+        # Install mode: clean slate
+        ufw --force reset >/dev/null
+        ufw default deny incoming  >/dev/null
+        ufw default allow outgoing >/dev/null
+        ufw allow 22/tcp   comment 'SSH'                    >/dev/null
+        ufw allow 443/tcp  comment 'xray tls/reality'       >/dev/null
+        ufw allow 443/udp  comment 'xray quic/hysteria'     >/dev/null
+        ufw allow 2222/tcp comment 'remnawave node api'     >/dev/null
+        ufw --force enable >/dev/null
+    fi
     if [[ -n "$EXTRA_PORTS" ]]; then
         IFS=',' read -ra PORTS <<< "$EXTRA_PORTS"
         for p in "${PORTS[@]}"; do
@@ -241,8 +376,7 @@ if [[ $DO_UFW -eq 1 ]]; then
             log "UFW allow $p"
         done
     fi
-    ufw --force enable >/dev/null
-    ok "UFW enabled: $(ufw status | grep -c ALLOW) rules"
+    ok "UFW: $(ufw status | grep -c ALLOW) rules active"
 else
     warn "Skipping UFW (--no-ufw)"
 fi
@@ -389,14 +523,26 @@ if [[ $DO_COMPOSE -eq 1 ]]; then
     docker compose logs --tail 30 || true
 fi
 
+# ---------- stamp version --------------------------------------------------
+prev_ver="none"
+[[ -f "$STAMP_FILE" ]] && prev_ver=$(cat "$STAMP_FILE" 2>/dev/null || echo unknown)
+echo "$BOOTSTRAP_VERSION" >"$STAMP_FILE"
+chmod 644 "$STAMP_FILE"
+
 # ---------- summary ---------------------------------------------------------
 echo
 echo "${C_BOLD}${C_G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_N}"
-ok "Bootstrap complete."
+if [[ "$MODE" == "update" ]]; then
+    ok "Update complete.  $prev_ver  →  $BOOTSTRAP_VERSION"
+else
+    ok "Bootstrap complete.  Version: $BOOTSTRAP_VERSION"
+fi
 echo "  Install dir : $INSTALL_DIR"
-echo "  BBR         : $(sysctl -n net.ipv4.tcp_congestion_control)"
+echo "  BBR         : $(sysctl -n net.ipv4.tcp_congestion_control) / $(sysctl -n net.core.default_qdisc)"
 echo "  Docker      : $(docker --version 2>/dev/null || echo 'not installed')"
 echo "  UFW         : $(ufw status 2>/dev/null | head -1)"
 echo "  Listening   :"
 ss -tlnp 2>/dev/null | awk 'NR>1 {print "    " $4 "  " $NF}' | sort -u | head -20
+echo
+echo "  Re-check anytime :  bash <(curl -fsSL https://raw.githubusercontent.com/jestivald/node-bootstrap/main/node-bootstrap.sh) --check"
 echo "${C_BOLD}${C_G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_N}"
